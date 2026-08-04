@@ -13,6 +13,7 @@ export default function App() {
   const [messages, setMessages] = useState([])
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
+  const [wakingUp, setWakingUp] = useState(true)
   const chatRef = useRef(null)
   const sessionIdRef = useRef(null)
 
@@ -37,6 +38,8 @@ export default function App() {
             stage: null,
           },
         ])
+      } finally {
+        setWakingUp(false)
       }
     }
     init()
@@ -110,6 +113,13 @@ export default function App() {
 
       <main className="chat-area" ref={chatRef}>
         <div className="messages">
+          {wakingUp && messages.length === 0 && (
+            <div className="message-row bot">
+              <div className="bubble bubble-bot waking">
+                <p>Server is waking up, please wait...</p>
+              </div>
+            </div>
+          )}
           {messages.map((m) => (
             <div key={m.id}>
               <MessageBubble message={m} />

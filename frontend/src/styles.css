@@ -184,6 +184,16 @@ body {
   opacity: 0.6;
 }
 
+.waking {
+  opacity: 0.7;
+  animation: pulse 2s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 0.5; }
+  50%      { opacity: 1; }
+}
+
 /* Quick-reply buttons: accent color, chip style. */
 .quick-replies {
   display: flex;
