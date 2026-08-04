@@ -10,7 +10,7 @@ ORDERS = {
 # Any order number not in ORDERS is treated as invalid.
 
 # Return policy text and mock returns link.
-RETURN_POLICY = "30-day returns. Items must be unused. Original packaging required."
+RETURN_POLICY = "30-day returns.\nItems must be unused.\nOriginal packaging required."
 RETURNS_LINK = "https://example.com/returns"  # placeholder, mock only
 
 # Shipping speed options shown to the user when relevant.

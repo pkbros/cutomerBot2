@@ -143,7 +143,7 @@ stateDiagram-v2
 
     [*] --> entryDecider: POST /chat { message }
 
-    entryDecider --> intent_router: no active flow, OR message is a menu word
+    entryDecider --> intent_router: no active flow, menu/greeting word, OR new intent
     entryDecider --> order_tracking: current_flow = "order_tracking"
     entryDecider --> recommendations: current_flow = "recommendations"
 
@@ -175,8 +175,8 @@ stateDiagram-v2
 ```mermaid
 flowchart TD
     A[START] --> B{entry_decider}
-    B -- active flow? --> F1[order_tracking / recommendations]
-    B -- none / menu word --> C[intent_router]
+    B -- active flow, same intent? --> F1[order_tracking / recommendations]
+    B -- none / menu word / greeting / new intent --> C[intent_router]
     C --> D{intent_decider}
     D -- order_tracking --> F1
     D -- returns --> R[returns]

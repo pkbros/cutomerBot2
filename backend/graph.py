@@ -6,7 +6,15 @@ from typing import Optional, TypedDict
 from langgraph.graph import END, START, StateGraph
 
 from nodes import handoff, intent_router, order_tracking, recommendations, returns
-from nodes.intent_router import MENU_WORDS
+from nodes.intent_router import GREETING_WORDS, MENU_WORDS, heuristic_classify
+
+# Intent labels that map 1:1 onto a flow node (mirrors intent_decider's routing table).
+FLOW_INTENTS = {
+    "order_tracking": "order_tracking",
+    "returns": "returns",
+    "recommendations": "recommendations",
+    "handoff": "handoff",
+}
 
 
 class BotState(TypedDict, total=False):
@@ -25,13 +33,24 @@ class BotState(TypedDict, total=False):
 
 
 def entry_decider(state):
-    # Send the message to the active flow node if one is mid-flight, else to the intent router.
+    # Send the message to the active flow node while one is mid-flight, UNLESS it starts a
+    # new intent of its own (greeting, or a different flow like "i want to return" during
+    # recommendations) — those are re-routed through the intent router to interrupt and restart.
     # "Back to menu" is always routed to the router so it resets to the main menu.
     flow = state.get("current_flow")
     message = (state.get("message") or "").strip().lower()
-    if flow and message not in MENU_WORDS:
-        return flow
-    return "intent_router"
+    if not flow or message in MENU_WORDS:
+        return "intent_router"
+
+    first_word = message.split()[0].rstrip(",.!?") if message.split() else ""
+    if first_word in GREETING_WORDS:
+        return "intent_router"
+
+    intent = heuristic_classify(message)
+    if intent is not None and FLOW_INTENTS.get(intent) != flow:
+        return "intent_router"
+
+    return flow
 
 
 def intent_decider(state):
