@@ -4,7 +4,7 @@ import QuickReplies from './components/QuickReplies.jsx'
 import OrderForm from './components/OrderForm.jsx'
 import { newSession, sendMessage } from './api.js'
 
-const MAIN_MENU = ['Track Order', 'Returns', 'Product Advice', 'Talk to Human']
+const MAIN_MENU = ['Track Order', 'Returns', 'Product Advice', 'Shipping Info', 'Talk to Human']
 const WELCOME = 'Welcome to basecamp. How can I help you gear up today?'
 
 // App: chat window shell — header, message log, quick replies, order form, and input box.
@@ -67,15 +67,16 @@ export default function App() {
       await ensureSession()
       const res = await sendMessage(sessionIdRef.current, trimmed)
       setAiAvailable(!!res.ai_available)
+      const replies = res.replies || [{ reply: res.reply, quick_replies: res.quick_replies || [] }]
       setMessages((prev) => [
         ...prev,
-        {
-          id: Date.now() + 1,
+        ...replies.map((b, i) => ({
+          id: Date.now() + i + 1,
           role: 'bot',
-          text: res.reply,
-          quickReplies: res.quick_replies || [],
-          pendingSlot: res.pending_slot || null,
-        },
+          text: b.reply,
+          quickReplies: b.quick_replies || [],
+          pendingSlot: i === replies.length - 1 ? res.pending_slot || null : null,
+        })),
       ])
     } catch (err) {
       setMessages((prev) => [

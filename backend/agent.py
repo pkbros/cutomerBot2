@@ -23,6 +23,7 @@ from actions import (
     validate_activity,
     validate_season,
 )
+from data import ORDERS
 
 # Exact-match words that always mean "back to main menu" (deterministic, no LLM).
 MENU_WORDS = {"back to menu", "menu", "main menu", "start over", "reset", "go back"}
@@ -40,9 +41,8 @@ BUTTON_ACTIONS = {
     "talk to a human": handoff,
 }
 
-# Containment phrases: when a SHORT message contains one of these exact phrases, route
-# deterministically. Only very specific menu phrases qualify, and only for short messages —
-# long/compound messages go to the LLM so multi-intent requests are never truncated.
+# Containment phrases: the deterministic NLU used ONLY when the AI is unavailable (degraded
+# mode). In the normal path, ALL free text goes to the LLM, which extracts intents + data.
 PHRASE_ACTIONS = [
     ("product advice", lambda s: recommendations_advance(s)),
     ("shipping information", shipping_info),
@@ -60,6 +60,10 @@ PHRASE_ACTIONS = [
     ("talk to human", handoff),
 ]
 PHRASE_MAX_WORDS = 6
+
+# Words signaling OTHER intents: when present, a message is never handled by a deterministic
+# shortcut (slot fill, track-order). It goes to the LLM intact so compound requests survive.
+NON_SLOT_WORDS = ("return", "refund", "policy", "ship", "recommend", "advice", "human", "agent")
 
 # Nouns that make "order_tracking" plausible even without a number (belt-and-suspenders guard).
 TRACK_NOUNS = (
@@ -85,18 +89,24 @@ SYSTEM_PROMPT = (
     "products for an activity or trip.\n"
     "- handoff: talking to a human, agent, or representative.\n"
     "- fallback: off-topic, unclear, gibberish, or anything else.\n"
-    "Use multiple intents in order when the message asks for several things. Prefer "
+    "Use multiple intents in order when the message asks for several things. Only include "
+    "intents the user explicitly asked about — never add related or nearby intents. Prefer "
     "recommendations for any request about buying products or gear unless it is clearly about "
     "order status, returns, shipping, or a human agent.\n"
     "form_updates: order_number = the customer's order number as digits only, if clearly an order "
     "reference; activity is exactly one of hiking, camping, cold_weather; season is exactly one of "
     "summer, winter, year-round; use null when unknown.\n"
+    "Always extract the order number into form_updates.order_number whenever the user mentions "
+    "one anywhere in the message, even in compound requests.\n"
     "Examples:\n"
     "user: where is my abc -> {\"intents\": [\"fallback\"], \"form_updates\": {\"order_number\": null, \"activity\": null, \"season\": null}}\n"
     "user: provide shipping information -> {\"intents\": [\"shipping_info\"], \"form_updates\": {\"order_number\": null, \"activity\": null, \"season\": null}}\n"
     "user: how long does shipping take -> {\"intents\": [\"shipping_info\"], \"form_updates\": {\"order_number\": null, \"activity\": null, \"season\": null}}\n"
     "user: where is my order -> {\"intents\": [\"order_tracking\"], \"form_updates\": {\"order_number\": null, \"activity\": null, \"season\": null}}\n"
+    "user: track order 333 -> {\"intents\": [\"order_tracking\"], \"form_updates\": {\"order_number\": \"333\", \"activity\": null, \"season\": null}}\n"
     "user: order is 111, tell status. and tell me about the return policy -> {\"intents\": [\"order_tracking\", \"returns\"], \"form_updates\": {\"order_number\": \"111\", \"activity\": null, \"season\": null}}\n"
+    "user: about order 222 and shipping details -> {\"intents\": [\"order_tracking\", \"shipping_info\"], \"form_updates\": {\"order_number\": \"222\", \"activity\": null, \"season\": null}}\n"
+    "user: tell me about order 111 and also about shipping -> {\"intents\": [\"order_tracking\", \"shipping_info\"], \"form_updates\": {\"order_number\": \"111\", \"activity\": null, \"season\": null}}\n"
     "user: some product advice -> {\"intents\": [\"recommendations\"], \"form_updates\": {\"order_number\": null, \"activity\": null, \"season\": null}}\n"
     "user: i need some ideas on the products i buy -> {\"intents\": [\"recommendations\"], \"form_updates\": {\"order_number\": null, \"activity\": null, \"season\": null}}\n"
     "user: give me gear suggestions for a trip -> {\"intents\": [\"recommendations\"], \"form_updates\": {\"order_number\": null, \"activity\": null, \"season\": null}}\n"
@@ -135,7 +145,7 @@ def call_llm(state, message):
             "user message": message,
         }
         response = client.chat.completions.create(
-            model=os.getenv("GROQ_MODEL", "llama-3.1-8b-instant"),
+            model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": json.dumps(context, default=str)},
@@ -169,11 +179,14 @@ def _guard_intents(state, message, parsed):
 
 def _execute_intent(state, intent, updates):
     # Run one intent's deterministic action; returns (reply, buttons, needs_input).
+    # needs_input is True when the intent could not complete (slot needed or invalid data),
+    # which stops the intent queue so later intents never run.
     if intent == "order_tracking":
         number = updates.get("order_number")
         if number:
             number = re.sub(r"\D", "", str(number))
-            return resolve_order(state, number) + (False,)
+            reply, buttons = resolve_order(state, number)
+            return reply, buttons, number not in ORDERS
         return track_order(state) + (True,)
     if intent == "shipping_info":
         return shipping_info(state) + (False,)
@@ -200,79 +213,97 @@ def _slot_stuck(state, intents):
 
 def run_agent(state, message):
     # Free-text pipeline: LLM NLU -> guards -> sequential intent execution.
+    # Returns a list of (reply, buttons) bubbles; one per resolved intent, in order.
     parsed = call_llm(state, message)
     if parsed is None:
         state["ai_available"] = False
-        return AI_UNAVAILABLE_REPLY, MAIN_MENU
+        return [(AI_UNAVAILABLE_REPLY, MAIN_MENU)]
     intents, updates = _guard_intents(state, message, parsed)
     if _slot_stuck(state, intents):
         # A pending slot was answered with invalid input: re-prompt deterministically.
         slot = state.get("pending_slot")
         if slot == "order":
-            return NO_NUMBER_REPLY, BACK_BUTTON
+            return [(NO_NUMBER_REPLY, BACK_BUTTON)]
         if slot == "activity":
-            return recommendations_advance(state, activity=message)
-        return recommendations_advance(state, season=message)
+            return [recommendations_advance(state, activity=message)]
+        return [recommendations_advance(state, season=message)]
     if not intents:
-        return fallback(state)
+        return [fallback(state)]
     if intents != ["fallback"]:
         state["unrecognized"] = 0
-    replies, buttons, needs_input = [], MAIN_MENU, False
+    bubbles = []
     for intent in intents:
         reply, buttons, needs_input = _execute_intent(state, intent, updates)
-        replies.append(reply)
+        bubbles.append((reply, buttons))
         if needs_input:
+            # The current intent needs more input (or failed): clear the queue and stop,
+            # so the customer focuses on the current issue and later intents never run.
             state["intent_queue"] = []
             break
-    return "\n\n".join(replies), buttons
+    return bubbles
+
+
+def _degraded_nlu(state, message):
+    # AI-unavailable NLU: containment phrases + deterministic track-order. Best effort only;
+    # in the normal path ALL free text goes to the LLM (which owns intent + data extraction).
+    low = (message or "").strip().lower()
+    if len(low.split()) <= PHRASE_MAX_WORDS and not re.search(r"\d{3,}", message):
+        for phrase, action in PHRASE_ACTIONS:
+            if phrase in low:
+                return [action(state)]
+    if "track order" in low and not any(w in low for w in NON_SLOT_WORDS):
+        number = extract_digits(message)
+        if number:
+            return [resolve_order(state, number)]
+        return [track_order(state)]
+    return [(AI_UNAVAILABLE_REPLY, MAIN_MENU)]
 
 
 def run_pipeline(state, message):
-    # Route one message: deterministic tiers first, LLM agent for everything else.
+    # Route one message: UI-level determinism (menu, greeting, buttons, pure-data slot fills),
+    # then the LLM agent for ALL free text. Degraded NLU only when the AI is unavailable.
+    # Always returns a list of (reply, buttons) bubbles.
     state["messages"].append({"role": "user", "content": message})
 
     low = (message or "").strip().lower()
     if not low:
-        return fallback(state)
+        return [fallback(state)]
 
     if low in MENU_WORDS:
-        return back_to_menu(state)
+        return [back_to_menu(state)]
 
     first_word = low.split()[0].rstrip(",.!?")
     if first_word in GREETING_WORDS or any(w in low for w in ("thank", "thx", "cheers")):
-        return greeting(state)
+        return [greeting(state)]
 
     if low in BUTTON_ACTIONS:
-        return BUTTON_ACTIONS[low](state)
-
-    if len(low.split()) <= PHRASE_MAX_WORDS:
-        for phrase, action in PHRASE_ACTIONS:
-            if phrase in low:
-                return action(state)
+        return [BUTTON_ACTIONS[low](state)]
 
     slot = state.get("pending_slot")
     if slot == "order":
         number = extract_digits(message)
-        if number:
-            return resolve_order(state, number)
+        # Deterministic slot fill for a pure number message. If the message also mentions
+        # returns/shipping/etc., route it to the LLM intact so compound requests survive.
+        if number and (not any(w in low for w in NON_SLOT_WORDS) or not _llm_available(state)):
+            return [resolve_order(state, number)]
         if not _llm_available(state):
-            return NO_NUMBER_REPLY, BACK_BUTTON
+            return [(NO_NUMBER_REPLY, BACK_BUTTON)]
 
     if slot == "activity":
         key = validate_activity(message)
-        if key:
-            return recommendations_advance(state, activity=key)
+        if key and not any(w in low for w in NON_SLOT_WORDS):
+            return [recommendations_advance(state, activity=key)]
         if not _llm_available(state):
-            return recommendations_advance(state, activity=message)
+            return [recommendations_advance(state, activity=message)]
 
     if slot == "season":
         key = validate_season(message)
-        if key:
-            return recommendations_advance(state, season=key)
+        if key and not any(w in low for w in NON_SLOT_WORDS):
+            return [recommendations_advance(state, season=key)]
         if not _llm_available(state):
-            return recommendations_advance(state, season=message)
+            return [recommendations_advance(state, season=message)]
 
     if not _llm_available(state):
-        return AI_UNAVAILABLE_REPLY, MAIN_MENU
+        return _degraded_nlu(state, message)
 
     return run_agent(state, message)

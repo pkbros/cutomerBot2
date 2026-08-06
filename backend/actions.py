@@ -5,7 +5,7 @@ import re
 
 from data import ORDERS, PRODUCT_CATEGORIES, RETURN_POLICY, RETURNS_LINK, SHIPPING
 
-MAIN_MENU = ["Track Order", "Returns", "Product Advice", "Talk to Human"]
+MAIN_MENU = ["Track Order", "Returns", "Product Advice", "Shipping Info", "Talk to Human"]
 ACTIVITY_BUTTONS = ["Hiking", "Camping", "Cold weather"]
 SEASON_BUTTONS = ["Summer", "Winter", "Year-round"]
 BACK_BUTTON = ["Back to menu"]
@@ -90,8 +90,8 @@ def resolve_order(state, number):
             HANDOFF_BUTTONS,
         )
     return (
-        f"I couldn't find an order with number '{number}'. Please double-check and enter a valid "
-        "order number (e.g. 111, 222, 333), or type Back to menu.",
+        f"I couldn't find an order with number '{number}'. Please double-check and enter a valid \
+        order number, or go back to menu to restart",
         BACK_BUTTON,
     )
 
@@ -216,12 +216,13 @@ def handoff(state):
 
 
 def fallback(state):
-    # Unrecognized message: menu buttons, escalating to a handoff offer after 2 misses.
+    # Unrecognized message: menu buttons only (the menu already includes Talk to Human — never a
+    # duplicate). After 2 misses the reply text escalates to a handoff offer; buttons stay clean.
     state["unrecognized"] = state.get("unrecognized", 0) + 1
     if state["unrecognized"] >= 2:
         return (
             "I'm not sure I understood that. Would you like to talk to a human instead, or pick "
             "an option below?",
-            MAIN_MENU + ["Talk to human"],
+            MAIN_MENU,
         )
     return ("I didn't understand that. Here are a few things I can help with:", MAIN_MENU)

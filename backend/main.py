@@ -57,14 +57,20 @@ def create_session():
 
 @app.post("/chat")
 def chat(req: ChatRequest):
-    # Run the agent pipeline for one user message and return the bot reply plus UI hints.
+    # Run the agent pipeline for one user message and return every bot bubble plus UI hints.
+    # Each resolved intent emits its own bubble (replies array); the top-level reply/quick_replies
+    # mirror the first bubble for backward compatibility.
     session = get_session(req.session_id)
     try:
-        reply, buttons = run_pipeline(session, req.message)
-        session["messages"].append({"role": "assistant", "content": reply})
+        bubbles = run_pipeline(session, req.message)
+        session["messages"].append(
+            {"role": "assistant", "content": "\n\n".join(reply for reply, _ in bubbles)}
+        )
+        replies = [{"reply": reply, "quick_replies": buttons} for reply, buttons in bubbles]
         return {
-            "reply": reply,
-            "quick_replies": buttons,
+            "reply": replies[0]["reply"],
+            "quick_replies": replies[0]["quick_replies"],
+            "replies": replies,
             "pending_slot": session.get("pending_slot"),
             "ai_available": _ai_available(session),
         }
@@ -73,6 +79,12 @@ def chat(req: ChatRequest):
         return {
             "reply": f"Sorry, I hit an unexpected error: {exc}. Please try again.",
             "quick_replies": ["Track Order", "Returns", "Product Advice", "Talk to Human"],
+            "replies": [
+                {
+                    "reply": f"Sorry, I hit an unexpected error: {exc}. Please try again.",
+                    "quick_replies": ["Track Order", "Returns", "Product Advice", "Talk to Human"],
+                }
+            ],
             "pending_slot": None,
             "ai_available": _ai_available(session),
         }
