@@ -9,6 +9,7 @@ from groq import Groq
 
 from actions import (
     BACK_BUTTON,
+    HANDOFF_BUTTONS,
     MAIN_MENU,
     back_to_menu,
     extract_digits,
@@ -221,8 +222,17 @@ def run_agent(state, message):
     intents, updates = _guard_intents(state, message, parsed)
     if _slot_stuck(state, intents):
         # A pending slot was answered with invalid input: re-prompt deterministically.
+        # The order slot counts these misses in retries so repeated garbage escalates to a
+        # handoff offer instead of looping forever (same rule as invalid order numbers).
         slot = state.get("pending_slot")
         if slot == "order":
+            state["retries"]["order_number"] += 1
+            if state["retries"]["order_number"] >= 2:
+                return [(
+                    "I still didn't find an order number in that. Would you like to talk to a "
+                    "human, or keep trying with the digits (e.g. 111)?",
+                    HANDOFF_BUTTONS,
+                )]
             return [(NO_NUMBER_REPLY, BACK_BUTTON)]
         if slot == "activity":
             return [recommendations_advance(state, activity=message)]

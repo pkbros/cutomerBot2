@@ -90,8 +90,8 @@ def resolve_order(state, number):
             HANDOFF_BUTTONS,
         )
     return (
-        f"I couldn't find an order with number '{number}'. Please double-check and enter a valid \
-        order number, or go back to menu to restart",
+        f"I couldn't find an order with number '{number}'. Please double-check and enter a "
+        "valid order number, or go back to menu to restart",
         BACK_BUTTON,
     )
 

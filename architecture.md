@@ -182,7 +182,7 @@ Run after every LLM call. The LLM proposes; the backend disposes.
 |------|----------|
 | Intent whitelist | Unknown labels dropped; empty list → fallback |
 | `order_tracking` without a number and without a track noun | Reclassified as `fallback` (kills `where is my <abc>?`) |
-| Pending slot answered with unusable input (slot-stuck) | Deterministic re-prompt with the slot's options |
+| Pending slot answered with unusable input (slot-stuck) | Deterministic re-prompt with the slot's options; order-slot misses count in `retries` and offer handoff at 2 |
 | Intent needs input or fails validation (e.g. order not in `ORDERS`) | `needs_input` → re-prompt, **clear the intent queue** — later intents never run |
 | Retry counters | `retries[slot]` / `unrecognized`; at 2 failures the reply appends a handoff offer (never automatic) |
 | Reply text | Always built by deterministic actions from `data.py` — the LLM never writes final replies |
