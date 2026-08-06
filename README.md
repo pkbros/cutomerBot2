@@ -90,7 +90,7 @@ These edge cases are deliberately designed to fail gracefully — they are good 
 |----------|----------------------|
 | AI key missing / Groq down | Buttons + digits work; known phrases answered by degraded NLU; other free text gets the AI-unavailable notice |
 | Order number not in system (`999`) | Re-prompt; second failure → handoff offer while still asking |
-| Gibberish at the order slot | Slot re-prompt (never an order prompt out of context) |
+| Gibberish at the order slot | Slot re-prompt (never an order prompt out of context); after 2 misses → handoff offer |
 | Compound request whose first intent fails | Later intents are dropped (queue-stop) until the user re-asks |
 | `where is my abc` (garbage as order) | Fallback reply + menu, never an order prompt |
 | Two unrecognized messages in a row | Second fallback reply text escalates to a handoff offer; buttons stay the clean 4-button menu (no duplicates) |
