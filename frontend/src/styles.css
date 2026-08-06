@@ -97,6 +97,10 @@ body {
   display: inline-block;
 }
 
+.status-dot.offline {
+  background: var(--error);
+}
+
 .brand-status span {
   font-size: 14px;
   font-weight: 600;

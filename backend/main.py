@@ -1,4 +1,4 @@
-# FastAPI app: CORS, session creation, and the single /chat endpoint that drives the LangGraph flow.
+# FastAPI app: CORS, session creation, and the single /chat endpoint that drives the agent pipeline.
 
 import os
 
@@ -7,7 +7,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from graph import run_graph
+from agent import run_pipeline
 from session import get_session, new_session_id
 
 load_dotenv()
@@ -35,6 +35,11 @@ app.add_middleware(
 )
 
 
+def _ai_available(session):
+    # Report whether the LLM is reachable for this session (lazy: set from real call outcomes).
+    return session.get("ai_available", bool(os.getenv("GROQ_API_KEY")))
+
+
 @app.get("/")
 def root():
     # Simple health check for deployment platforms.
@@ -43,29 +48,31 @@ def root():
 
 @app.post("/session/new")
 def create_session():
-    # Create a fresh in-memory session and return its id.
+    # Create a fresh in-memory session and return its id plus current AI availability.
     session_id = new_session_id()
-    get_session(session_id)
-    return {"session_id": session_id}
+    session = get_session(session_id)
+    session["ai_available"] = bool(os.getenv("GROQ_API_KEY"))
+    return {"session_id": session_id, "ai_available": session["ai_available"]}
 
 
 @app.post("/chat")
 def chat(req: ChatRequest):
-    # Run the conversation graph for one user message and return the bot reply plus quick replies.
+    # Run the agent pipeline for one user message and return the bot reply plus UI hints.
     session = get_session(req.session_id)
     try:
-        result = run_graph(session, req.message)
+        reply, buttons = run_pipeline(session, req.message)
+        session["messages"].append({"role": "assistant", "content": reply})
+        return {
+            "reply": reply,
+            "quick_replies": buttons,
+            "pending_slot": session.get("pending_slot"),
+            "ai_available": _ai_available(session),
+        }
     except Exception as exc:
         # Safety net for unexpected errors; keep the menu available so the chat stays usable.
         return {
             "reply": f"Sorry, I hit an unexpected error: {exc}. Please try again.",
             "quick_replies": ["Track Order", "Returns", "Product Advice", "Talk to Human"],
-            "flow": None,
-            "stage": None,
+            "pending_slot": None,
+            "ai_available": _ai_available(session),
         }
-    return {
-        "reply": result.get("reply", ""),
-        "quick_replies": result.get("quick_replies", []),
-        "flow": result.get("current_flow"),
-        "stage": result.get("stage"),
-    }

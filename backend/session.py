@@ -2,7 +2,7 @@
 
 import uuid
 
-_sessions = {}
+_SESSIONS = {}
 
 
 def new_session_id():
@@ -10,16 +10,22 @@ def new_session_id():
     return str(uuid.uuid4())
 
 
+def _new_state(session_id):
+    # Build the central conversation state: form, pending slot, intent queue, retries, availability.
+    return {
+        "session_id": session_id,
+        "messages": [],
+        "form": {"order_number": None, "activity": None, "season": None},
+        "pending_slot": None,
+        "intent_queue": [],
+        "retries": {"order_number": 0, "activity": 0, "season": 0},
+        "unrecognized": 0,
+        "ai_available": True,
+    }
+
+
 def get_session(session_id):
     # Return the state dict for a session, creating it on first use.
-    if session_id not in _sessions:
-        _sessions[session_id] = {
-            "session_id": session_id,
-            "messages": [],
-            "current_flow": None,
-            "stage": None,
-            "order_number": None,
-            "rec_answers": {},
-            "unrecognized_count": 0,
-        }
-    return _sessions[session_id]
+    if session_id not in _SESSIONS:
+        _SESSIONS[session_id] = _new_state(session_id)
+    return _SESSIONS[session_id]
