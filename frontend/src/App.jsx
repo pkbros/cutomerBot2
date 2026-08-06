@@ -4,7 +4,7 @@ import QuickReplies from './components/QuickReplies.jsx'
 import OrderForm from './components/OrderForm.jsx'
 import { newSession, sendMessage } from './api.js'
 
-const MAIN_MENU = ['Track Order', 'Returns', 'Product Advice', 'Talk to Human']
+const MAIN_MENU = ['Track Order', 'Returns', 'Product Advice', 'Shipping Info', 'Talk to Human']
 const WELCOME = 'Welcome to basecamp. How can I help you gear up today?'
 
 // App: chat window shell — header, message log, quick replies, order form, and input box.
@@ -14,6 +14,7 @@ export default function App() {
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
   const [wakingUp, setWakingUp] = useState(true)
+  const [aiAvailable, setAiAvailable] = useState(true)
   const chatRef = useRef(null)
   const sessionIdRef = useRef(null)
 
@@ -21,21 +22,18 @@ export default function App() {
   useEffect(() => {
     async function init() {
       try {
-        const id = await newSession()
-        sessionIdRef.current = id
-        setSessionId(id)
+        await ensureSession()
         setMessages([
-          { id: 1, role: 'bot', text: WELCOME, quickReplies: MAIN_MENU, flow: null, stage: null },
+          { id: 1, role: 'bot', text: WELCOME, quickReplies: MAIN_MENU, pendingSlot: null },
         ])
       } catch (err) {
         setMessages([
           {
             id: 1,
             role: 'bot',
-            text: 'Could not reach the backend. Make sure it is running and VITE_API_URL is correct.',
-            quickReplies: [],
-            flow: null,
-            stage: null,
+            text: 'Could not reach the backend yet. Please try the buttons, or type again in a moment.',
+            quickReplies: MAIN_MENU,
+            pendingSlot: null,
           },
         ])
       } finally {
@@ -44,6 +42,15 @@ export default function App() {
     }
     init()
   }, [])
+
+  // Create a session lazily if one is missing (first attempt may have failed while waking up).
+  async function ensureSession() {
+    if (sessionIdRef.current) return
+    const data = await newSession()
+    sessionIdRef.current = data.session_id
+    setSessionId(data.session_id)
+    setAiAvailable(!!data.ai_available)
+  }
 
   // Keep the chat scrolled to the newest message.
   useEffect(() => {
@@ -57,17 +64,19 @@ export default function App() {
     setMessages((prev) => [...prev, { id: Date.now(), role: 'user', text: trimmed }])
     setLoading(true)
     try {
+      await ensureSession()
       const res = await sendMessage(sessionIdRef.current, trimmed)
+      setAiAvailable(!!res.ai_available)
+      const replies = res.replies || [{ reply: res.reply, quick_replies: res.quick_replies || [] }]
       setMessages((prev) => [
         ...prev,
-        {
-          id: Date.now() + 1,
+        ...replies.map((b, i) => ({
+          id: Date.now() + i + 1,
           role: 'bot',
-          text: res.reply,
-          quickReplies: res.quick_replies || [],
-          flow: res.flow || null,
-          stage: res.stage || null,
-        },
+          text: b.reply,
+          quickReplies: b.quick_replies || [],
+          pendingSlot: i === replies.length - 1 ? res.pending_slot || null : null,
+        })),
       ])
     } catch (err) {
       setMessages((prev) => [
@@ -77,8 +86,7 @@ export default function App() {
           role: 'bot',
           text: 'Something went wrong talking to the bot. Please try again.',
           quickReplies: MAIN_MENU,
-          flow: null,
-          stage: null,
+          pendingSlot: null,
         },
       ])
     } finally {
@@ -101,8 +109,8 @@ export default function App() {
           <div>
             <h1 className="brand-title">North Star Support Bot</h1>
             <div className="brand-status">
-              <span className="status-dot" />
-              <span>Online</span>
+              <span className={`status-dot ${aiAvailable ? '' : 'offline'}`} />
+              <span>{aiAvailable ? 'Online' : 'AI offline — buttons work'}</span>
             </div>
           </div>
         </div>
@@ -126,7 +134,7 @@ export default function App() {
               {m.role === 'bot' && m.quickReplies && m.quickReplies.length > 0 && (
                 <QuickReplies options={m.quickReplies} onSelect={handleSend} />
               )}
-              {m.role === 'bot' && m.flow === 'order_tracking' && m.stage === 'ask_order' && (
+              {m.role === 'bot' && m.pendingSlot === 'order' && (
                 <OrderForm onSelect={handleSend} />
               )}
             </div>

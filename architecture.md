@@ -1,31 +1,33 @@
 # Architecture — North Star Support Bot
 
-How the system works end to end: components, the LangGraph conversation state machine, every API call, and the design decisions behind it. All diagrams use Mermaid.
+How the system works end to end: components, the agentic core, the central conversation state, every API call, and the design decisions behind it. All diagrams use Mermaid.
 
 ---
 
 ## 1. System overview
 
-A two-tier web app: a static React frontend talks over HTTP to a FastAPI backend. The backend runs the conversation through a LangGraph state machine and uses Groq (Llama) to classify the user's intent. All conversation state lives in memory on the backend, keyed by session id.
+A two-tier web app: a static React frontend talks over HTTP to a FastAPI backend. Every free-text message is handled by a single **agent core** that calls Groq (Llama) to classify intent and extract entities in one structured call. Quick-reply **buttons are deterministic** and always available alongside the AI, so users can navigate by clicking even when the AI is unreachable. All conversation state lives in memory on the backend, keyed by session id.
 
 | Layer | Tech | Where it runs |
 |-------|------|---------------|
 | Frontend | Vite + React (JS), plain CSS | Vercel (static) |
-| Backend | FastAPI, LangGraph | Render |
-| LLM | Groq (Llama 3.3 70B), used only for intent classification | Groq cloud |
-| State | Python dict keyed by session id | Backend memory (resets on restart) |
+| Backend | FastAPI, agent core + deterministic actions | Render |
+| LLM | Groq (Llama), one structured JSON call per free-text message | Groq cloud |
+| State | Python dict keyed by session id (central form) | Backend memory (resets on restart) |
 | Data | Mock orders, return policy, product catalog in `data.py` | Backend |
 
 ```mermaid
 flowchart LR
-    U[Evaluator / user] -->|browser, HTTPS| F[React frontend<br/>Vercel]
+    U[User] -->|browser, HTTPS| F[React frontend<br/>Vercel]
     F -->|POST /session/new, POST /chat| B[FastAPI backend<br/>Render]
-    B -->|reads/writes state| S[(In-memory session store<br/>dict keyed by session_id)]
-    B -->|POST chat.completions| G[Groq<br/>Llama 3.3 70B]
-    B -->|env vars only| E[(Render env:<br/>GROQ_API_KEY, ALLOWED_ORIGIN)]
+    B -->|free text| G[Groq<br/>Llama, one JSON call]
+    B -->|button labels, digits, guards| A[Deterministic actions]
+    B <-->|reads and writes| S[(In-memory session state<br/>central form + queue)]
+    G --> B
+    A --> B
 ```
 
-The Groq API key lives **only** in the backend's environment. It is never sent to the frontend; the frontend only ever sees bot replies.
+The Groq API key lives **only** in the backend's environment. It is never sent to the frontend; the frontend only ever sees bot replies and button labels.
 
 ---
 
@@ -33,20 +35,16 @@ The Groq API key lives **only** in the backend's environment. It is never sent t
 
 ```
 backend/
-  main.py                FastAPI app: CORS, /session/new, /chat
-  graph.py               LangGraph state machine: nodes, conditional edges, compiled graph
-  nodes/
-    intent_router.py     Groq intent classification (+ "back to menu" reset words)
-    order_tracking.py    order lookup flow
-    returns.py           return policy flow (one-shot)
-    recommendations.py   activity → season → product suggestion flow
-    handoff.py           simulated live-agent handoff (one-shot)
-  data.py                exact mock data (ORDERS, RETURN_POLICY, RETURNS_LINK, SHIPPING, PRODUCT_CATEGORIES)
-  session.py             in-memory session store
+  main.py                FastAPI app: CORS, /session/new, /chat, ai_available flag
+  agent.py               LLM agent: prompt with form + queue + history, JSON call, guards
+  actions.py             deterministic flow functions (buttons, slot filling, canned replies)
+  session.py             in-memory session store (central state)
+  data.py                exact mock data (ORDERS, RETURN_POLICY, SHIPPING, PRODUCT_CATEGORIES)
+  requirements.txt
 frontend/
   src/
-    App.jsx              chat shell: header, message log, input bar
-    components/          MessageBubble, QuickReplies, OrderForm
+    App.jsx              chat shell: header, message log, input bar, AI-availability handling
+    components/          MessageBubble, QuickReplies, OrderForm (digits-only)
     api.js               fetch wrappers for /session/new and /chat
     styles.css           "Rugged Minimalism" design tokens
 ```
@@ -55,18 +53,18 @@ frontend/
 
 ## 3. Conversation state
 
-The LangGraph state (a `TypedDict`) is persisted per session between HTTP calls. This is what makes the bot multi-turn despite being stateless over HTTP.
+The state is a single Python dict persisted per session. It is the **central form** that is injected into the LLM prompt every turn, so the AI always knows the current context (order number collected, activity chosen, unanswered questions, pending compound-intent queue).
 
 | Field | Purpose |
 |-------|---------|
 | `session_id` | Key into the session store |
 | `messages` | Chat history (sent to Groq as context) |
-| `current_flow` | Active flow (`order_tracking`, `recommendations`, …) or `None` |
-| `stage` | Step inside the active flow (`ask_order`, `ask_activity`, `ask_season`, `done`) |
-| `order_number` | Order number captured in the tracking flow |
-| `rec_answers` | Answers collected in the recommendation flow |
-| `unrecognized_count` | Consecutive fallback counter (drives handoff escalation) |
-| `reply` / `quick_replies` | Output produced by the current graph step |
+| `form` | Collected data: `order_number`, `activity`, `season` |
+| `pending_slot` | Slot currently being filled (`order` / `activity` / `season`) or `None` |
+| `intent_queue` | Ordered flow actions awaiting execution from a compound message |
+| `retries` | Failure counter per slot (`order_number`, `activity`, `season`) — drives the handoff offer |
+| `unrecognized` | Consecutive fallback counter — at 2 the fallback reply adds a handoff offer |
+| `ai_available` | Whether the LLM responded successfully in this session |
 
 ```mermaid
 erDiagram
@@ -74,13 +72,12 @@ erDiagram
     STATE {
         string session_id PK
         list  messages
-        string current_flow
-        string stage
-        string order_number
-        dict  rec_answers
-        int   unrecognized_count
-        string reply
-        list  quick_replies
+        dict  form
+        string pending_slot
+        list  intent_queue
+        dict  retries
+        int   unrecognized
+        bool  ai_available
     }
 ```
 
@@ -88,244 +85,229 @@ erDiagram
 
 ## 4. Request lifecycle
 
-Every user message is one `POST /chat`. The backend loads the session state, runs one graph step, persists the mutated state back, and returns the reply. The frontend renders quick replies and inline forms based on the `flow`/`stage` fields returned.
+Every user message is one `POST /chat`. Two input paths mutate the **same state**:
+
+1. **Button path (deterministic, always works):** the message exactly matches a button label, menu word, greeting, or a pure digit run. A fixed action function runs — no LLM call, nothing can go wrong.
+2. **Agent path (free text):** the LLM classifies intent and extracts entities in one structured JSON call, backend guards validate the result, then deterministic action functions execute the intents in order.
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant U as User (browser)
-    participant F as React app (Vercel)
-    participant B as FastAPI (Render)
-    participant S as Session store (memory)
-    participant G as Groq (Llama)
+    participant U as User
+    participant F as React app
+    participant B as FastAPI
+    participant S as Session state
+    participant G as Groq
 
-    U->>F: load page
-    F->>B: POST /session/new
-    B->>S: create empty state dict
-    B-->>F: { session_id }
-    F-->>U: welcome message + 4 quick replies
+    U->>F: click Track Order button
+    F->>B: POST /chat { message: Track Order }
+    B->>B: exact button label match
+    B->>S: form.pending_slot = order
+    B-->>F: reply + pending_slot order
+    F-->>U: bot bubble + OrderForm
 
-    U->>F: click "Track Order"
-    F->>B: POST /chat { session_id, "Track Order" }
-    B->>S: load state (current_flow = null)
-    B->>B: classify: keyword rules → order_tracking (LLM only if rules fail)
-    B->>S: save current_flow="order_tracking", stage="ask_order"
-    B-->>F: { reply: "Please enter your order number…", flow:"order_tracking", stage:"ask_order" }
-    F-->>U: bot bubble + inline OrderForm
+    U->>F: type 111
+    F->>B: POST /chat
+    B->>B: digit run, deterministic lookup
+    B->>S: status reply, pending_slot cleared
+    B-->>F: Order #111 is Shipped + Back to menu
+    F-->>U: status + buttons
 
-    U->>F: submit "111"
-    F->>B: POST /chat { session_id, "111" }
-    B->>S: load state (current_flow = "order_tracking")
-    B->>B: look up ORDERS["111"] → Shipped
-    B->>S: save reply, reset current_flow=null and stage="done"
-    B-->>F: { reply: "Order #111 is Shipped. Arriving tomorrow", quick_replies:["Back to menu"] }
-    F-->>U: status + "Back to menu" button
+    U->>F: type where is my order?
+    F->>B: POST /chat
+    B->>G: one structured NLU call
+    G-->>B: intent order_tracking, no number
+    B->>B: guard: slot needed
+    B->>S: pending_slot = order
+    B-->>F: Please enter your order number
 ```
 
 ### API contract
 
 | Endpoint | Request body | Response |
 |----------|--------------|----------|
-| `POST /session/new` | — | `{ session_id }` |
-| `POST /chat` | `{ session_id, message }` | `{ reply, quick_replies, flow, stage }` |
+| `POST /session/new` | — | `{ session_id, ai_available }` |
+| `POST /chat` | `{ session_id, message }` | `{ reply, quick_replies, replies, pending_slot, ai_available }` |
 
-`flow`/`stage` are extra fields the frontend uses to decide when to render the order form. The core contract from PLAN.md (`reply`, `quick_replies`, `flow`) is preserved. CORS is locked to `ALLOWED_ORIGIN` (Vercel URL in production, localhost:5173 in dev).
+`replies` is an array of `{ reply, quick_replies }` — one entry per resolved intent, rendered as separate bot bubbles in order. The top-level `reply`/`quick_replies` mirror the first bubble. `pending_slot` tells the frontend when to render the OrderForm (`pending_slot == "order"`); quick replies render whenever `quick_replies` is non-empty. CORS is locked to `ALLOWED_ORIGIN`.
 
 ---
 
-## 5. LangGraph state machine
+## 5. Decision pipeline
 
-The graph runs **once per HTTP call**. Each call traverses from `START` to `END` along a path chosen by three decider functions, then returns. The persistent `current_flow`/`stage` fields in the session store carry the conversation across calls.
+Each message flows through UI-level determinism first (exact button labels, menu words, greetings, pure-digit slot fills), then the LLM, then deterministic guards and actions. **All other free text goes to the LLM at any length** — there is no word-count gate, no phrase containment, and no digit-based routing in the live path. Heuristics exist only as a degraded NLU when the AI is unreachable.
+
+```mermaid
+flowchart TD
+    A[user message] --> B{exact button label,<br/>menu word, or greeting?}
+    B -- yes --> C[deterministic action function]
+    B -- no --> D{pending_slot is order<br/>and message is pure digits?}
+    D -- yes --> C
+    D -- no --> E{AI available?}
+    E -- no --> F[degraded NLU: known containment<br/>phrases, track order + digits,<br/>else AI notice + menu buttons]
+    E -- yes --> G[LLM structured NLU call<br/>llama-3.3-70b-versatile]
+    G --> H{guards pass?}
+    H -- no --> I[fallback or slot-stuck re-prompt]
+    H -- ok --> J[execute intents in order]
+    J -- a step needs input or fails --> I
+    J -- all resolved --> L[one bubble per intent,<br/>with its own buttons, in order]
+```
+
+---
+
+## 6. Agent core (`agent.py`)
+
+One Groq call per free-text message, `response_format=json_object`, `temperature=0`, model `llama-3.3-70b-versatile` (override with `GROQ_MODEL`). The prompt carries the valid intent labels, entity enums, the **central form**, the **pending slot**, the **intent queue**, and the last messages of history. The model owns **all** natural-language understanding — intent selection *and* entity extraction. The backend adds no forced intents and no keyword guessing on top of it; it only validates and executes.
+
+```json
+{
+  "intents": ["order_tracking", "returns"],
+  "form_updates": { "order_number": "111", "activity": null, "season": null }
+}
+```
+
+- **Intents (whitelist):** `order_tracking`, `shipping_info`, `returns`, `recommendations`, `handoff`, `fallback`.
+- **Enums:** `activity` is one of `hiking | camping | cold_weather`; `season` is one of `summer | winter | year-round`. The model may only emit these values.
+- **Extraction rule:** the prompt instructs the model to always put the order number into `form_updates.order_number` whenever the user mentions one anywhere in the message — even in compound requests — and to include only intents the user explicitly asked about.
+- **Few-shot examples** cover the known failure cases and compound forms: `where is my abc → fallback`, `provide shipping information → shipping_info`, `order is 111 tell status and the return policy → [order_tracking, returns]`, `about order 222 and shipping details → [order_tracking, shipping_info]`, `track order 333 → [order_tracking]`.
+- The response is JSON-parsed and whitelist-validated; any parse failure degrades to the AI-down notice.
+
+---
+
+## 7. Guards (deterministic spine)
+
+Run after every LLM call. The LLM proposes; the backend disposes.
+
+| Rule | Behavior |
+|------|----------|
+| Intent whitelist | Unknown labels dropped; empty list → fallback |
+| `order_tracking` without a number and without a track noun | Reclassified as `fallback` (kills `where is my <abc>?`) |
+| Pending slot answered with unusable input (slot-stuck) | Deterministic re-prompt with the slot's options |
+| Intent needs input or fails validation (e.g. order not in `ORDERS`) | `needs_input` → re-prompt, **clear the intent queue** — later intents never run |
+| Retry counters | `retries[slot]` / `unrecognized`; at 2 failures the reply appends a handoff offer (never automatic) |
+| Reply text | Always built by deterministic actions from `data.py` — the LLM never writes final replies |
+
+---
+
+## 8. Flow actions (`actions.py`)
+
+Every action is a pure function over the central state: mutates `form` / `pending_slot` / `retries` / `intent_queue` and returns `(reply, buttons)`; the agent adds a `needs_input` flag per intent. The same functions serve both the button path and the agent path, so clicking and typing produce identical state transitions.
+
+| Action | Behavior |
+|--------|----------|
+| `track_order` | Sets `pending_slot = order`, asks for the number |
+| `resolve_order` | Looks up `ORDERS` → status, or re-prompts on invalid (retry counter) |
+| `shipping_info` | One-shot: standard + expedited shipping text from `data.py` |
+| `returns` | One-shot: policy text + returns link |
+| `recommendations` | Slot-fills `activity` then `season`, then maps to `PRODUCT_CATEGORIES` |
+| `handoff` | One-shot: simulated live-agent message |
+| `back_to_menu` | Clears `form`, `intent_queue`, `retries`, `pending_slot` → main menu |
+
+### Slot filling
+
+`pending_slot` is the single "what are we waiting for" pointer. On invalid input the bot stays in the slot, re-prompts, and bumps `retries[slot]`. After **2 failures** the reply adds a handoff offer while still asking — the user can retry or click.
 
 ```mermaid
 stateDiagram-v2
     direction LR
-
-    [*] --> entryDecider: POST /chat { message }
-
-    entryDecider --> intent_router: no active flow, menu/greeting word, OR new intent
-    entryDecider --> order_tracking: current_flow = "order_tracking"
-    entryDecider --> recommendations: current_flow = "recommendations"
-
-    intent_router --> order_tracking: intent = order_tracking
-    intent_router --> returns: intent = returns
-    intent_router --> recommendations: intent = recommendations
-    intent_router --> handoff: intent = handoff
-    intent_router --> fallback: intent = fallback / unparseable
-    intent_router --> Done: "back to menu" → reset + show main menu
-
-    fallback --> handoff: unrecognized_count >= 2 (escalation)
-    fallback --> Done: unrecognized_count < 2 (show menu again)
-
-    order_tracking --> Done
-    returns --> Done
-    recommendations --> Done
-    handoff --> Done
-
-    Done --> [*]
-    note right of Done
-      current_flow is reset to None when a
-      flow finishes, so the next message
-      re-enters intent_router
-    end note
+    [*] --> ask_order: pending_slot = order
+    ask_order --> ask_order: invalid number, retries + 1
+    ask_order --> resolved: valid number
+    ask_order --> offer: retries >= 2
+    offer --> ask_order: user retries
+    offer --> handoff: user clicks Talk to human
+    resolved --> [*]: status + Back to menu
+    handoff --> [*]: live agent (simulated)
 ```
-
-### Edge routing logic (`graph.py`)
-
-```mermaid
-flowchart TD
-    A[START] --> B{entry_decider}
-    B -- active flow, same intent? --> F1[order_tracking / recommendations]
-    B -- none / menu word / greeting / new intent --> C[intent_router]
-    C --> D{intent_decider}
-    D -- order_tracking --> F1
-    D -- returns --> R[returns]
-    D -- recommendations --> F1
-    D -- handoff --> H[handoff]
-    D -- fallback --> FB[fallback]
-    FB -- unrecognized_count >= 2 --> H
-    FB -- else --> END
-    F1 --> END
-    R --> END
-    H --> END
-```
-
-### Node behavior summary
-
-| Node | Entry condition | Behavior | Exit |
-|------|-----------------|----------|------|
-| `intent_router` | no active flow | keyword rules first (handoff > returns > order > recommendations), greetings caught before rules; Groq only if rules fail **and** a key is set | routes to flow node |
-| `order_tracking` | intent OR active flow | shipping-speed questions answered directly; else ask for order number (keyless) or LLM-extract it (key mode) → look up `ORDERS` → status or invalid | stage `done` |
-| `returns` | intent | exact policy text + shipping info + returns link | stage `done` (one-shot) |
-| `recommendations` | intent OR active flow | ask activity → ask season → map to `PRODUCT_CATEGORIES` | stage `done` |
-| `handoff` | intent OR fallback escalation | simulated live-agent message | stage `done` (one-shot) |
-| `fallback` | unclassifiable intent | "I didn't understand" + menu; escalates after 2 in a row | stage `done` |
 
 ---
 
-## 6. Intent classification (layered)
+## 9. Compound intents
 
-Intent detection is a two-tier pipeline. **Tier 1** is keyword rules — instant, deterministic, and fully functional with no API key. **Tier 2** is Groq, used only when rules can't decide **and** `GROQ_API_KEY` is set; otherwise the message falls through to the fallback node.
+A message like `order is 111, tell status. and tell me about return policy` yields `intents: [order_tracking, returns]`. Intents are executed **one at a time, in order**, until completion. Each resolved intent emits its **own bot bubble** with its own buttons (each action is a separate function call; nothing is concatenated):
 
-```mermaid
-flowchart TD
-    A[user message] --> B{menu / greeting?}
-    B -- yes --> M[canned reply + main menu]
-    B -- no --> C{keyword rules}
-    C -- handoff > returns > order > recommendations --> I[deterministic intent]
-    C -- no rule matched --> D{GROQ_API_KEY set?}
-    D -- no --> FB[fallback]
-    D -- yes --> E[Groq: single label, temperature=0, max_tokens=16]
-    E -- valid label --> I
-    E -- invalid / error --> FB
-```
-
-Precedence matters: **handoff > returns > order_tracking > recommendations**. Greetings and menu words are caught before the rules, so "hi" or "thanks" get a friendly reply without spending anything. The LLM prompt carries the 5 valid labels, few-shot examples, and the last 8 messages of history; the response is whitelist-validated and any failure degrades to fallback — so Groq being down or absent never breaks the chat. The LLM exists for the long tail ("is my stuff gonna make it in time?") that keyword rules can't catch.
-
----
-
-## 7. Flow internals
-
-### 7.1 Order tracking (slot filling — ask, then trust)
-
-Order numbers are **never guessed from unconstrained text**. The bot either asks for the number and trusts the prompted reply (keyless mode), or lets the LLM extract it when a key is present. A digit run followed by a quantity/duration word ("100 days") is rejected, so the bot never "finds" an order number that is really a date or amount.
+- `order_tracking` resolves 111 → status bubble; then `returns` runs → policy bubble. Two separate bubbles, in order.
+- If any intent **needs input or fails validation** (e.g. order number `412` is not in `ORDERS`), the remaining queue is **cleared and execution stops there** — later intents never run, so the customer stays focused on the current issue. The failing intent's bubble carries the re-prompt.
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant U as User
     participant B as FastAPI
-    participant G as Groq (key mode only)
-    participant D as data.py ORDERS
-
-    Note over U,B: flow entered as order_tracking
-    alt shipping-speed question (how long / delivery time / expedited)
-        B-->>U: Standard: 3-5 business days. Expedited: 1-2 business days. + Back to menu
-    else key mode, number found
-        B->>G: extract order number from free text
-        B-->>U: status (e.g. Order #222 is Processing. Ships in 24 hours) + Back to menu
-    else key mode, no number
-        B-->>U: Please enter your order number… (stage=ask_order)
-    else keyless ask, number found
-        B-->>U: Please enter your order number… (stage=ask_order)
-        U->>B: 111 (via OrderForm)
-        B->>D: ORDERS.get(111)
-        B-->>U: status (e.g. Order #111 is Shipped. Arriving tomorrow) + Back to menu
-    else keyless ask, number not found
-        B-->>U: I couldn't find an order with that number… + Back to menu
-    end
-    Note over B: current_flow → None, stage → done
+    participant G as Groq
+    U->>B: order is 111, tell status. and returns policy
+    B->>G: NLU with form context
+    G-->>B: intents order_tracking, returns
+    B->>B: resolve order 111
+    B-->>U: bubble 1: Order #111 is Shipped + Back to menu
+    B->>B: resolve returns policy
+    B-->>U: bubble 2: policy text + Back to menu
 ```
 
-### 7.2 Product recommendations
+---
 
-```mermaid
-stateDiagram-v2
-    direction LR
-    [*] --> ask_activity: "What activity are you preparing for?"
-    ask_activity --> ask_season: user picks Hiking / Camping / Cold weather
-    ask_season --> suggest: user picks Summer / Winter / Year-round
-    suggest --> [*]: "I'd recommend: …" + Back to menu
-    note right of suggest
-      _map_activity_to_category(activity, season)
-      → hiking | camping | cold_weather
-      Winter/snow overrides to cold_weather
-    end note
-```
+## 10. Handoff — never automatic
 
-### 7.3 Fallback → handoff escalation
+There is no silent escalation anywhere. On repeated failures the bot escalates the offer while still asking, never forcing:
+
+- **Invalid slot answers (2×)** — the reply appends `[Talk to human, Back to menu]` buttons.
+- **Unrecognized messages (2×)** — the reply text offers a human handoff; the button row stays the clean 4-button menu (the menu already includes Talk to Human — no duplicate buttons).
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant U as User
     participant B as FastAPI
-    participant G as Groq (optional)
-
-    U->>B: "asdfgh"
-    B->>B: rules miss, no key (or LLM says fallback)
-    B-->>U: "I didn't understand…" + 4 menu buttons (count=1)
-
-    U->>B: "zxcvb"
-    B-->>U: "You're now connected to a Live Agent (simulated)…" (count=2 → escalate)
+    U->>B: 999 (invalid order number)
+    B-->>U: I couldn't find an order with number '999'. Please double-check and enter a valid order number, or go back to menu to restart + Back to menu
+    U->>B: 888 (second failure)
+    B-->>U: I still couldn't find an order matching '888'. Would you like to talk to a human, or keep trying with a valid order number? + Talk to human, Back to menu
+    U->>B: Talk to human
+    B-->>U: You're now connected to a Live Agent (simulated). A specialist will pick this up shortly. Anything else in the meantime? + Back to menu
 ```
 
 ---
 
-## 8. Frontend behavior
+## 11. AI availability and degradation
+
+`ai_available` is set **lazily from real outcomes** — no probing calls:
+
+- No `GROQ_API_KEY` → `False` from session start.
+- A Groq timeout/error during a call → `False` for the rest of the session.
+
+While `False`, the backend still answers every message: deterministic buttons and digits work fully, a **degraded NLU** catches known containment phrases (`how long does shipping take`, `track order 333`, …), and everything else gets the notice *"Sorry, I can't reach the AI right now. Please use the buttons to navigate, or try typing again in a moment."*
 
 ```mermaid
-flowchart TD
-    A[App.jsx] --> B[api.js]
-    B -->|fetch| C[Backend /chat]
-    A --> D[MessageBubble]
-    A --> E[QuickReplies]
-    A --> F[OrderForm]
-
-    E -->|onSelect sends label| A
-    F -->|onSelect sends order number| A
-
-    subgraph rendering rules
-        Q1[quick replies rendered when quickReplies non-empty]
-        Q2[OrderForm rendered only when<br/>flow=order_tracking AND stage=ask_order]
-    end
+flowchart LR
+    A[AI available] -->|free text| B[LLM NLU]
+    A -->|buttons, digits| C[deterministic actions]
+    D[AI unavailable] -->|free text| E[degraded NLU:<br/>known phrases, track order + digits]
+    E -->|matched| C
+    E -->|unmatched| F[AI notice + menu buttons]
+    D -->|buttons, digits| C
 ```
-
-- On mount, `App.jsx` calls `/session/new` and holds the id in React state (never localStorage).
-- Bot bubbles (Deep Forest `#1b3022`) left, user bubbles (light `#dce9ff`) right, Safety Orange `#fe932c` accent buttons — per `design/DESIGN.md`.
-- Persistent **Talk to Human** button in the header sends the text `"Talk to human"`, which the intent router maps to `handoff` at any point in the conversation.
-- After a flow resolves, the returned `quick_replies: ["Back to menu"]` render a button that resets to the main menu.
 
 ---
 
-## 9. Deployment
+## 12. Frontend behavior
+
+- On mount, `App.jsx` calls `/session/new`, holds the id in React state, and stores `ai_available`.
+- Quick-reply buttons render whenever `quick_replies` is non-empty — they are the deterministic navigation layer and are shown **alongside** the AI, never hidden.
+- Each entry of the `replies` array renders as its **own bot bubble** with its own buttons, in order.
+- OrderForm renders only when `pending_slot == "order"` (attached to the last bubble) and validates digits-only client-side.
+- The text input is **never disabled**: if the AI is unreachable, typing returns the AI-unavailable notice while buttons keep the flows working.
+- Persistent **Talk to Human** header button works in both modes (deterministic label).
+
+---
+
+## 13. Deployment
 
 ```mermaid
 flowchart LR
     subgraph Render[Render — backend]
-        B[FastAPI + LangGraph]
+        B[FastAPI + agent core]
         S[(in-memory sessions)]
-        E[env: ALLOWED_ORIGIN<br/>GROQ_API_KEY optional]
+        E[env: ALLOWED_ORIGIN<br/>GROQ_API_KEY]
     end
     subgraph Vercel[Vercel — frontend]
         F[Static Vite build]
@@ -333,7 +315,6 @@ flowchart LR
     end
     G[Groq Cloud]
     U[Evaluator, incognito browser]
-
     U -->|https| F
     F -->|https POST /chat| B
     B --> S
@@ -342,78 +323,18 @@ flowchart LR
     F -.-> V
 ```
 
-Build/start commands: backend `pip install -r requirements.txt` then `uvicorn main:app --host 0.0.0.0 --port $PORT`; frontend standard Vite build. Two-instance memory means sessions never survive restarts — acceptable per PLAN.md.
+Build/start commands: backend `pip install -r requirements.txt` then `uvicorn main:app --host 0.0.0.0 --port $PORT`; frontend standard Vite build. Sessions never survive restarts — acceptable per PLAN.md.
 
 ---
 
-## 10. Determinism & LLM usage (design discussion)
+## 14. Design rationale
 
-### 10.1 What is deterministic today
+**LLM-first, deterministic spine.** The goal is a support bot with Dialogflow/Botpress-class accuracy: intent classification *and* entity extraction in one NLU call, form-style slot filling with validation and re-prompts, context-aware state, fallback intents, and human-handoff offers. A pure keyword matcher can always be defeated by novel phrasing, so the LLM owns natural-language understanding.
 
-The **flow logic is fully deterministic.** Given the same state and message, the graph always:
+**Buttons are deterministic by construction.** Button labels and digit form inputs are a closed set, so their handlers never need a model — and they are always rendered, giving users free will to click or type, and giving the bot a guaranteed-working path when the AI is unreachable.
 
-- routes to the same node (`entry_decider`, `intent_decider` are pure rules),
-- returns the same policy text, order statuses, and product lists (all from `data.py`, exact strings),
-- produces the same quick replies,
-- resets state identically after `done`.
+**The LLM proposes, the backend disposes.** All replies are built by deterministic actions from exact mock data; the LLM only ever decides *what the user wants* (intent + entities). This prevents hallucinated order statuses or paraphrased policy text while keeping full natural-language flexibility.
 
-The **keyless mode is fully deterministic end to end**: intent detection is pure keyword rules, and order numbers are only read from the prompted reply. Nothing random and no external dependency. When a key is set, only the LLM tier (ambiguous classification and order-number extraction) is non-deterministic; `temperature=0`, whitelist validation, and graceful fallback keep it stable and safe.
+**Graceful degradation beats hard failure.** LLM down → buttons still work, known phrases are still answered by the degraded NLU, and everything else gets a clear notice. Nothing crashes, no dead ends, no automatic handoffs.
 
-### 10.2 Rejected: LLM-only intent detection
-
-A pure LLM gate makes the entire demo depend on one live external API and one model call per message:
-
-- **Latency/failure:** every message waits on Groq; a timeout or quota error blocks everything.
-- **No offline mode:** without `GROQ_API_KEY` the bot cannot even recognize "Returns" or "Talk to human".
-- **Determinism:** identical phrasings can occasionally get a different flow.
-- **Cost:** every message, even "Returns" or "111", spends a token.
-
-### 10.3 Implemented: layered intent detection (heuristic first, LLM fallback)
-
-The classifier keeps common cases instant and deterministic and uses the LLM only for ambiguity:
-
-```mermaid
-flowchart TD
-    A[user message] --> B{menu / greeting?}
-    B -- yes --> C[canned reply + menu — no LLM]
-    B -- no --> D{keyword rules}
-    D -- match --> E[deterministic intent — no LLM]
-    D -- miss --> F{GROQ_API_KEY set?}
-    F -- no --> G[fallback node — no LLM]
-    F -- yes --> H[Groq classify]
-    H --> I[intent or fallback]
-```
-
-Rules are checked in precedence order (`handoff > returns > order_tracking > recommendations`). Order numbers are handled by **slot filling**: keyless mode asks for the number and trusts the prompted reply (with a quantity-word guard so "100 days" is never read as an order id); key mode asks the LLM to extract it from free text. Shipping-speed questions are answered directly with the exact shipping info.
-
-This gives: **offline degradability** (the graded path works with zero keys), **determinism for the demo-critical flows**, **cost reduction** (LLM fires only on ambiguity), and **full natural-language coverage** when a key is present.
-
-### 10.4 Where NOT to use the LLM
-
-Reply generation stays rule-based. The mock data is exact and the contract forbids inventing order numbers or changing policy text. If the LLM generated replies it could hallucinate a fake status or paraphrase the policy. The right split:
-
-| Concern | Best handled by |
-|---------|-----------------|
-| Which flow / what the user wants | Rules first, LLM fallback (implemented) |
-| Order number in free text | Ask for it keyless; LLM extraction key-mode |
-| Order status, policy text, product lists | Exact mock data (never the LLM) |
-| Tone/polish of *final* canned reply | Optional LLM rephrasing after lookup succeeds, as a cosmetic layer |
-
-### 10.5 Cost analysis
-
-| Mode | LLM calls | Typical session cost |
-|------|-----------|----------------------|
-| No key | 0 | $0 (fully functional, guided) |
-| Key, clear phrasing | 0 (rules win) | $0 |
-| Key, order message with a number | 1 (extraction) | < $0.001 |
-| Key, ambiguous non-order message | 1 (classification) | < $0.001 |
-
-Uses a small model (`llama-3.1-8b-instant`), `temperature=0`, and `max_tokens=16` (classification) / `8` (extraction) so even paid sessions stay in the sub-cent range.
-
-### 10.6 Summary
-
-- The bot is **fully deterministic keyless** and **deterministic everywhere except the LLM tier** when a key is set.
-- **Heuristic-first with LLM fallback is the production pattern:** same natural-language coverage as LLM-only, plus determinism, offline resilience, lower latency, and near-zero cost.
-- Deterministic **outputs** (exact statuses/policy/products) + flexible **inputs** (rules → LLM only for ambiguity) is the correct model for a support bot: consistent, correct answers that never hallucinate data, while still understanding whatever the user types.
-
-Current implementation = **§10.3 (hybrid, implemented)**. The heuristic tier fully covers the graded path keyless; the LLM tier adds natural-language flexibility and order-number extraction when a key is set.
+**Trust the model — don't fight it.** Intent classification and entity extraction are the LLM's job, and it does them with the full message in context. No phrase-containment, digit-gating, or forced-intent heuristics sit in front of it; they were removed after they caused truncation bugs (`about order 222 and shipping details` must never become shipping-only). Backend heuristics exist only where they cannot be wrong: exact button labels, pure-digit slot fills, and the degraded NLU for the AI-down case.

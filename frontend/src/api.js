@@ -3,11 +3,10 @@
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000'
 
 export async function newSession() {
-  // Ask the backend for a fresh session id.
+  // Ask the backend for a fresh session id and the current AI availability.
   const res = await fetch(`${API_URL}/session/new`, { method: 'POST' })
   if (!res.ok) throw new Error(`Session request failed: ${res.status}`)
-  const data = await res.json()
-  return data.session_id
+  return res.json()
 }
 
 export async function sendMessage(sessionId, message) {
